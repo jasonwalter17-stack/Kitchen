@@ -241,6 +241,7 @@
         <h2 class="section-title">Recipes</h2>
         <div class="row">
           <input id="recipe-search" placeholder="Search recipes or tags..." style="width: 220px;">
+          <button class="btn" id="btn-import-recipe">Import from URL</button>
           <button class="btn primary" id="btn-add-recipe">+ New recipe</button>
         </div>
       </div>
@@ -854,7 +855,223 @@ document.getElementById("pantry-filter").onchange = renderPantry;
 
 /* Recipes events */
 document.getElementById("btn-add-recipe").onclick = () => { editingRecipeId = null; openModal(recipeFormHtml(null)); };
+document.getElementById("btn-import-recipe").onclick = () => openImportModal();
 document.getElementById("recipe-search").oninput = renderRecipes;
+
+/* ============================================================
+ *  RECIPE IMPORT — fetch a recipe URL and parse schema.org JSON-LD
+ * ============================================================ */
+
+function openImportModal() {
+  openModal(`
+    <h3>Import recipe from URL</h3>
+    <p class="muted" style="font-size:13px; margin-top:-4px;">
+      Works with most recipe sites (NYT Cooking, AllRecipes, Serious Eats, Bon Appétit, most food blogs) that use standard recipe markup.
+    </p>
+    <div style="display:grid; gap:10px;">
+      <div><label class="field">Recipe URL</label>
+        <input id="imp-url" placeholder="https://..." autofocus>
+      </div>
+      <div id="imp-status" class="muted" style="font-size:13px; min-height: 20px;"></div>
+      <div class="row between" style="margin-top:4px;">
+        <button class="btn" data-act="cancel">Cancel</button>
+        <button class="btn primary" id="btn-do-import">Fetch</button>
+      </div>
+    </div>
+  `);
+  document.getElementById("btn-do-import").onclick = doImport;
+  document.getElementById("imp-url").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") doImport();
+  });
+}
+
+async function doImport() {
+  const urlInput = document.getElementById("imp-url");
+  const status = document.getElementById("imp-status");
+  const btn = document.getElementById("btn-do-import");
+  const url = urlInput.value.trim();
+  if (!url) { status.textContent = "Paste a URL first."; return; }
+  try { new URL(url); } catch { status.textContent = "That doesn't look like a valid URL."; return; }
+
+  btn.disabled = true; btn.textContent = "Fetching…"; status.textContent = "Loading the page…";
+  try {
+    const recipe = await importRecipeFromUrl(url);
+    status.textContent = "Got it! Opening the editor…";
+    // Open a fresh "New recipe" form, then populate it with the imported data
+    setTimeout(() => {
+      closeModal();
+      openModal(recipeFormHtml(null));
+      prefillRecipeForm(recipe);
+    }, 200);
+  } catch (err) {
+    status.innerHTML = `<span style="color:var(--danger);">${escapeHtml(err.message || "Import failed")}</span>`;
+    btn.disabled = false; btn.textContent = "Try again";
+  }
+}
+
+async function importRecipeFromUrl(url) {
+  // Route through a public CORS proxy since most recipe sites don't allow direct browser fetches.
+  const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
+  const resp = await fetch(proxied);
+  if (!resp.ok) throw new Error(`Couldn't fetch the page (status ${resp.status}).`);
+  const html = await resp.text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
+  for (const s of scripts) {
+    let data;
+    try { data = JSON.parse(s.textContent); } catch { continue; }
+    const r = findRecipeNode(data);
+    if (r) return normalizeRecipe(r);
+  }
+  throw new Error("No structured recipe data found on this page. Try a different URL, or add the recipe manually.");
+}
+
+function findRecipeNode(data) {
+  if (!data) return null;
+  if (Array.isArray(data)) {
+    for (const item of data) {
+      const r = findRecipeNode(item); if (r) return r;
+    }
+    return null;
+  }
+  if (typeof data !== "object") return null;
+  const t = data["@type"];
+  const types = Array.isArray(t) ? t : [t];
+  if (types.includes("Recipe")) return data;
+  if (data["@graph"]) return findRecipeNode(data["@graph"]);
+  return null;
+}
+
+function normalizeRecipe(r) {
+  const name = typeof r.name === "string" ? r.name.trim() : "Untitled recipe";
+  const servings = parseServings(r.recipeYield);
+  const rawIngs = Array.isArray(r.recipeIngredient) ? r.recipeIngredient : [];
+  const ingredients = rawIngs.map(parseIngredientLine).filter(i => i.name);
+  if (!ingredients.length) ingredients.push({ name: "", quantity: 1, unit: "count" });
+  let instructions = "";
+  const ri = r.recipeInstructions;
+  if (typeof ri === "string") instructions = ri;
+  else if (Array.isArray(ri)) {
+    instructions = ri.map(step => {
+      if (typeof step === "string") return step;
+      if (step && step.text) return step.text;
+      if (step && step.name) return step.name;
+      if (step && Array.isArray(step.itemListElement)) {
+        return step.itemListElement.map(s => s.text || s.name || "").filter(Boolean).join("\n");
+      }
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  instructions = instructions.replace(/\s*\n\s*\n+/g, "\n").trim();
+  const tags = [];
+  if (r.recipeCategory) (Array.isArray(r.recipeCategory) ? r.recipeCategory : [r.recipeCategory]).forEach(x => tags.push(x));
+  if (r.recipeCuisine)  (Array.isArray(r.recipeCuisine)  ? r.recipeCuisine  : [r.recipeCuisine]).forEach(x => tags.push(x));
+  const cleanTags = [...new Set(tags.filter(t => typeof t === "string").map(t => t.trim()).filter(Boolean))].slice(0, 6);
+  // Returning a stub object (no id) — recipeFormHtml expects a full shape; fill in what's needed.
+  return {
+    name, servings, tags: cleanTags,
+    ingredients, instructions, notes: "",
+    id: null, // form handles null as "create new" when Save is clicked
+  };
+}
+
+function parseServings(y) {
+  if (y == null) return 2;
+  if (typeof y === "number") return Math.max(1, Math.round(y));
+  if (Array.isArray(y)) y = y[0];
+  const m = String(y).match(/(\d+)/);
+  return m ? Number(m[1]) : 2;
+}
+
+const UNIT_MAP = {
+  "cup": "cup", "cups": "cup", "c": "cup", "c.": "cup",
+  "tsp": "tsp", "tsp.": "tsp", "teaspoon": "tsp", "teaspoons": "tsp", "t": "tsp",
+  "tbsp": "tbsp", "tbsp.": "tbsp", "tablespoon": "tbsp", "tablespoons": "tbsp", "tbs": "tbsp", "tbl": "tbsp", "tb": "tbsp", "t.": "tbsp",
+  "g": "g", "gram": "g", "grams": "g", "gr": "g",
+  "kg": "kg", "kilogram": "kg", "kilograms": "kg", "kilo": "kg",
+  "oz": "oz", "oz.": "oz", "ounce": "oz", "ounces": "oz",
+  "lb": "lb", "lb.": "lb", "lbs": "lb", "lbs.": "lb", "pound": "lb", "pounds": "lb",
+  "ml": "ml", "ml.": "ml", "milliliter": "ml", "milliliters": "ml",
+  "l": "L", "l.": "L", "liter": "L", "liters": "L", "litre": "L", "litres": "L",
+};
+const UNICODE_FRACTIONS = {
+  "½": 0.5, "⅓": 1/3, "⅔": 2/3, "¼": 0.25, "¾": 0.75,
+  "⅕": 0.2, "⅖": 0.4, "⅗": 0.6, "⅘": 0.8,
+  "⅙": 1/6, "⅚": 5/6, "⅛": 0.125, "⅜": 0.375, "⅝": 0.625, "⅞": 0.875,
+};
+
+function parseQuantityString(s) {
+  s = String(s).trim();
+  // unicode fraction alone
+  if (UNICODE_FRACTIONS[s] != null) return UNICODE_FRACTIONS[s];
+  // mixed with unicode, with or without space: "1½" or "1 ½"
+  const mU = s.match(/^(\d+)\s*([\u00BC-\u00BE\u2150-\u215E])$/);
+  if (mU) return Number(mU[1]) + (UNICODE_FRACTIONS[mU[2]] || 0);
+  // "1 1/2"
+  const mixed = s.match(/^(\d+)\s+(\d+)\/(\d+)$/);
+  if (mixed) return Number(mixed[1]) + Number(mixed[2]) / Number(mixed[3]);
+  // "1/2"
+  const frac = s.match(/^(\d+)\/(\d+)$/);
+  if (frac) return Number(frac[1]) / Number(frac[2]);
+  // "1.5" or "1"
+  const n = Number(s);
+  return isNaN(n) ? 1 : n;
+}
+
+function prefillRecipeForm(recipe) {
+  try {
+    const nameEl = document.getElementById("r-name");
+    if (nameEl) nameEl.value = recipe.name || "";
+    const servEl = document.getElementById("r-servings");
+    if (servEl) servEl.value = recipe.servings || 2;
+    const tagsEl = document.getElementById("r-tags");
+    if (tagsEl) tagsEl.value = (recipe.tags || []).join(", ");
+    const instrEl = document.getElementById("r-instr");
+    if (instrEl) instrEl.value = recipe.instructions || "";
+    const container = document.getElementById("r-ings");
+    if (container && recipe.ingredients && recipe.ingredients.length) {
+      container.innerHTML = recipe.ingredients.map((i, idx) => ingredientRow(i, idx)).join("");
+    }
+  } catch (e) { console.warn("prefill failed", e); }
+}
+
+function parseIngredientLine(raw) {
+  let line = String(raw || "").trim();
+  if (!line) return { name: "", quantity: 1, unit: "count" };
+  // Normalize non-breaking space and multiple whitespace
+  line = line.replace(/\u00A0/g, " ").replace(/\s+/g, " ");
+  // Pre-split unicode fractions from digits: "1½" -> "1 ½"
+  line = line.replace(/(\d)([\u00BC-\u00BE\u2150-\u215E])/g, "$1 $2");
+
+  // Capture leading quantity: number / fraction / mixed / unicode (with or without space)
+  const qtyRe = /^((?:\d+\s+)?\d+\/\d+|\d+\s+[\u00BC-\u00BE\u2150-\u215E]|\d+(?:\.\d+)?|[\u00BC-\u00BE\u2150-\u215E])(?:\s+)/;
+  let quantity = 1;
+  let rest = line;
+  const qm = line.match(qtyRe);
+  if (qm) {
+    quantity = parseQuantityString(qm[1]);
+    rest = line.slice(qm[0].length);
+  }
+
+  // Capture optional unit
+  let unit = "count";
+  const uMatch = rest.match(/^([A-Za-z]+\.?)\s+/);
+  if (uMatch) {
+    const candidate = uMatch[1].toLowerCase();
+    if (UNIT_MAP[candidate]) {
+      unit = UNIT_MAP[candidate];
+      rest = rest.slice(uMatch[0].length);
+    }
+  }
+
+  // Clean up the ingredient name: drop anything after a comma (e.g. ", chopped") for brevity
+  let name = rest.split(",")[0].trim();
+  // Strip leading "of " which sometimes follows units ("pinch of salt")
+  name = name.replace(/^of\s+/i, "");
+  if (!name) name = line; // fallback: use whole line
+
+  return { name, quantity: quantity || 1, unit };
+}
 
 /* Plan events */
 document.getElementById("plan-prev").onclick = () => { planStartDate = addDays(planStartDate, -7); renderPlan(); };
