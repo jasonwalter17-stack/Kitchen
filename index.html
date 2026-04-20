@@ -51,7 +51,19 @@
   }
   .brand h1 { font-size: 18px; margin: 0; letter-spacing: -0.01em; }
   .brand .sub { font-size: 12px; color: var(--muted); margin-top: 1px; }
-  .header-actions { display: flex; gap: 8px; }
+  .header-actions { display: flex; gap: 8px; align-items: center; }
+  .chip-expiring {
+    display: none; align-items: center; gap: 6px;
+    padding: 5px 10px; border-radius: 999px;
+    background: var(--warn-soft); color: var(--warn);
+    font-size: 12px; font-weight: 600; cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .chip-expiring:hover { border-color: var(--warn); }
+  .chip-expiring .dot {
+    width: 7px; height: 7px; border-radius: 50%; background: var(--warn);
+  }
+  .chip-expiring.visible { display: inline-flex; }
 
   /* Tabs */
   .tabs {
@@ -187,6 +199,9 @@
       </div>
     </div>
     <div class="header-actions">
+      <button class="chip-expiring" id="chip-expiring" title="Jump to pantry">
+        <span class="dot"></span><span id="chip-expiring-text"></span>
+      </button>
       <button class="btn small" id="btn-export">Export</button>
       <button class="btn small" id="btn-import">Import</button>
       <button class="btn small" id="btn-settings">Settings</button>
@@ -765,6 +780,22 @@ function render() {
   renderRecipes();
   renderPlan();
   renderShopping();
+  renderExpiringChip();
+}
+
+function renderExpiringChip() {
+  const chip = document.getElementById("chip-expiring");
+  const text = document.getElementById("chip-expiring-text");
+  const today = new Date(); today.setHours(0,0,0,0);
+  const weekOut = addDays(today, 7);
+  const count = state.pantry.filter(it => {
+    if (!it.expiresAt) return false;
+    const d = new Date(it.expiresAt); d.setHours(0,0,0,0);
+    return d < weekOut; // includes already expired + anything up through 7 days out
+  }).length;
+  if (count === 0) { chip.classList.remove("visible"); return; }
+  text.textContent = `${count} expiring this week`;
+  chip.classList.add("visible");
 }
 
 function escapeHtml(s) {
@@ -774,6 +805,9 @@ function escapeHtml(s) {
 }
 
 /* Header buttons */
+document.getElementById("chip-expiring").onclick = () => {
+  document.querySelector('.tab-btn[data-tab="pantry"]').click();
+};
 document.getElementById("btn-export").onclick = () => {
   const blob = new Blob([JSON.stringify(state, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);

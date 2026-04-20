@@ -1,6 +1,6 @@
 /* Kitchen service worker — caches the app shell so it opens offline.
    Bump CACHE_NAME when you change index.html or assets to force an update. */
-const CACHE_NAME = "kitchen-v1";
+const CACHE_NAME = "kitchen-v2";
 const APP_SHELL = [
   "./",
   "./index.html",
