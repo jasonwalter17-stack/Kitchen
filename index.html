@@ -910,11 +910,35 @@ async function doImport() {
 }
 
 async function importRecipeFromUrl(url) {
-  // Route through a public CORS proxy since most recipe sites don't allow direct browser fetches.
-  const proxied = `https://api.allorigins.win/raw?url=${encodeURIComponent(url)}`;
-  const resp = await fetch(proxied);
-  if (!resp.ok) throw new Error(`Couldn't fetch the page (status ${resp.status}).`);
-  const html = await resp.text();
+  // Most recipe sites don't allow direct cross-origin browser fetches, so we route
+  // through a CORS proxy. Public ones come and go; try a chain so one outage doesn't kill us.
+  const proxies = [
+    u => `https://corsproxy.io/?${encodeURIComponent(u)}`,
+    u => `https://api.codetabs.com/v1/proxy?quest=${encodeURIComponent(u)}`,
+    u => `https://api.allorigins.win/raw?url=${encodeURIComponent(u)}`,
+    u => `https://cors.eu.org/${u}`,
+  ];
+  let html = null;
+  const errors = [];
+  for (const build of proxies) {
+    const proxyUrl = build(url);
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 15000);
+      const resp = await fetch(proxyUrl, { signal: controller.signal });
+      clearTimeout(timer);
+      if (!resp.ok) { errors.push(`${new URL(proxyUrl).host} → HTTP ${resp.status}`); continue; }
+      const text = await resp.text();
+      if (text && text.length > 500) { html = text; break; }
+      errors.push(`${new URL(proxyUrl).host} → empty response`);
+    } catch (e) {
+      errors.push(`${new URL(proxyUrl).host} → ${e.message || "failed"}`);
+    }
+  }
+  if (!html) {
+    throw new Error(`Couldn't reach the page through any proxy. Tried: ${errors.join("; ")}. Try a different URL, or add the recipe manually.`);
+  }
+
   const doc = new DOMParser().parseFromString(html, "text/html");
   const scripts = doc.querySelectorAll('script[type="application/ld+json"]');
   for (const s of scripts) {
@@ -923,7 +947,7 @@ async function importRecipeFromUrl(url) {
     const r = findRecipeNode(data);
     if (r) return normalizeRecipe(r);
   }
-  throw new Error("No structured recipe data found on this page. Try a different URL, or add the recipe manually.");
+  throw new Error("Page loaded but no structured recipe data found on it. Some sites (especially paywalled ones) hide the recipe markup. Try a different URL, or add the recipe manually.");
 }
 
 function findRecipeNode(data) {
